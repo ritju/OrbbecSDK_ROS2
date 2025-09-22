@@ -149,7 +149,7 @@ def generate_launch_description():
         DeclareLaunchArgument('frames_per_trigger', default_value='2'),
         DeclareLaunchArgument('software_trigger_period', default_value='33'),  # ms
         DeclareLaunchArgument('enable_frame_sync', default_value='true'),
-        DeclareLaunchArgument('ordered_pc', default_value='false'),
+        DeclareLaunchArgument('ordered_pc', default_value='true'),
         DeclareLaunchArgument('use_hardware_time', default_value='true'),
         DeclareLaunchArgument('enable_depth_scale', default_value='true'),
         DeclareLaunchArgument('enable_decimation_filter', default_value='false'),

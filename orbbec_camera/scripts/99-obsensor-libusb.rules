@@ -130,3 +130,10 @@ SUBSYSTEM=="usb", ATTR{idProduct}=="06a6", ATTR{idVendor}=="2bc5", MODE:="0666",
 SUBSYSTEM=="usb", ATTR{idProduct}=="05a6", ATTR{idVendor}=="2bc5", MODE:="0666", OWNER:="root", GROUP:="video", SYMLINK+="gemini_ew_rgb"
 SUBSYSTEM=="usb", ATTR{idProduct}=="06a7", ATTR{idVendor}=="2bc5", MODE:="0666", OWNER:="root", GROUP:="video", SYMLINK+="gemini_ew_lite"
 SUBSYSTEM=="usb", ATTR{idProduct}=="069d", ATTR{idVendor}=="2bc5", MODE:="0666", OWNER:="root", GROUP:="video", SYMLINK+="astra_pro2"
+
+# Gemini 335 uses libusb/usbfs. After a USB port reset the kernel rebinds uvcvideo
+# and usbhid before the camera node can reclaim the interface. Unbind those
+# drivers as soon as they attach, and keep the link out of autosuspend.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2bc5", ATTR{idProduct}=="0800", ATTR{power/control}="on", ATTR{power/autosuspend}="-1"
+ACTION=="bind", SUBSYSTEM=="usb", DRIVER=="uvcvideo", ATTRS{idVendor}=="2bc5", ATTRS{idProduct}=="0800", RUN+="/bin/sh -c 'echo -n $kernel > /sys/bus/usb/drivers/uvcvideo/unbind || true'"
+ACTION=="bind", SUBSYSTEM=="usb", DRIVER=="usbhid", ATTRS{idVendor}=="2bc5", ATTRS{idProduct}=="0800", RUN+="/bin/sh -c 'echo -n $kernel > /sys/bus/usb/drivers/usbhid/unbind || true'"

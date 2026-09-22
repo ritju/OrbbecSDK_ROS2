@@ -4090,6 +4090,12 @@ void OBCameraNode::startStreams() {
                        "Current interleave laser pattern sync delay: " << device_->getIntProperty(
                            OB_PROP_FRAME_INTERLEAVE_LASER_PATTERN_SYNC_DELAY_INT));
   }
+  const auto started_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  last_color_frame_ns_.store(0);
+  last_depth_frame_ns_.store(0);
+  streams_started_ns_.store(started_ns);
   pipeline_started_.store(true);
 }
 
@@ -4837,6 +4843,75 @@ void OBCameraNode::setupTopics() {
   }
 }
 
+void OBCameraNode::recordVideoFrameArrival(bool color, bool depth) {
+  const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  if (color) {
+    last_color_frame_ns_.store(now_ns, std::memory_order_relaxed);
+  }
+  if (depth) {
+    last_depth_frame_ns_.store(now_ns, std::memory_order_relaxed);
+  }
+}
+
+void OBCameraNode::noteControlLinkFailure(bool link_dead) {
+  if (!link_dead) {
+    consecutive_control_failures_.store(0);
+    return;
+  }
+  const int failures = consecutive_control_failures_.fetch_add(1) + 1;
+  if (failures >= 3) {
+    reconnect_requested_.store(true);
+  }
+}
+
+bool OBCameraNode::enabledVideoStreamsStalled() const {
+  if (is_playback_device_ || !pipeline_started_.load() || !is_running_.load()) {
+    return false;
+  }
+  const auto started_ns = streams_started_ns_.load();
+  if (started_ns == 0) {
+    return false;
+  }
+  const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  constexpr int64_t kStallNs = 5LL * 1000 * 1000 * 1000;
+  if (now_ns - started_ns < kStallNs) {
+    return false;
+  }
+
+  const auto stream_silent = [&](bool enabled, int64_t last_frame_ns) {
+    if (!enabled) {
+      return true;
+    }
+    if (last_frame_ns == 0) {
+      return now_ns - started_ns >= kStallNs;
+    }
+    return now_ns - last_frame_ns >= kStallNs;
+  };
+
+  const bool watch_color = enable_stream_.count(COLOR) && enable_stream_.at(COLOR);
+  const bool watch_depth = enable_stream_.count(DEPTH) && enable_stream_.at(DEPTH);
+  if (!watch_color && !watch_depth) {
+    return false;
+  }
+  return stream_silent(watch_color, last_color_frame_ns_.load()) &&
+         stream_silent(watch_depth, last_depth_frame_ns_.load());
+}
+
+bool OBCameraNode::takeReconnectRequest() {
+  if (is_playback_device_) {
+    return false;
+  }
+  if (reconnect_requested_.exchange(false)) {
+    consecutive_control_failures_.store(0);
+    return true;
+  }
+  return enabledVideoStreamsStalled();
+}
+
 void OBCameraNode::onTemperatureUpdate(diagnostic_updater::DiagnosticStatusWrapper &status) {
   try {
     // Check to ensure we're not shutting down and device is valid
@@ -4874,6 +4949,7 @@ void OBCameraNode::onTemperatureUpdate(diagnostic_updater::DiagnosticStatusWrapp
     uint32_t data_size = sizeof(OBDeviceTemperature);
     device_->getStructuredData(OB_STRUCT_DEVICE_TEMPERATURE,
                                reinterpret_cast<uint8_t *>(&temperature), &data_size);
+    noteControlLinkFailure(false);
     status.add("CPU Temperature", temperature.cpuTemp);
     status.add("IR Temperature", temperature.irTemp);
     status.add("LDM Temperature", temperature.ldmTemp);
@@ -4887,6 +4963,12 @@ void OBCameraNode::onTemperatureUpdate(diagnostic_updater::DiagnosticStatusWrapp
     status.add("Chip Bottom Temperature", temperature.chipBottomTemp);
     status.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "Temperature is normal");
   } catch (const ob::Error &e) {
+    const int error_status = static_cast<int>(e.getStatus());
+    const char *message = e.getMessage();
+    const bool empty_response =
+        message != nullptr && std::string(message).find("response size(0)") != std::string::npos;
+    noteControlLinkFailure(error_status == OB_ERROR_DEVICE_RESPONSE_WRONG_DATA_SIZE ||
+                           empty_response);
     RCLCPP_ERROR_STREAM(
         logger_, "Failed to TemperatureUpdate1: " << orbbec_camera::formatObErrorWithStatus(e));
     status.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR,
@@ -6104,6 +6186,7 @@ void OBCameraNode::onNewFrameSetCallback(std::shared_ptr<ob::FrameSet> frame_set
     CHECK_NOTNULL(device_info);
     auto depth_frame = frame_set->getFrame(OB_FRAME_DEPTH);
     auto color_frame = frame_set->getFrame(OB_FRAME_COLOR);
+    recordVideoFrameArrival(static_cast<bool>(color_frame), static_cast<bool>(depth_frame));
     auto left_ir_frame = frame_set->getFrame(OB_FRAME_IR_LEFT);
     auto right_ir_frame = frame_set->getFrame(OB_FRAME_IR_RIGHT);
     auto left_color_frame = frame_set->getFrame(OB_FRAME_COLOR_LEFT);

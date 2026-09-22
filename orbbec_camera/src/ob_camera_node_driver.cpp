@@ -520,7 +520,41 @@ void OBCameraNodeDriver::checkConnectTimer() {
     return;
   } else if (!ob_camera_node_ && !ob_lidar_node_) {
     device_connected_.store(false);
+    return;
   }
+  if (!ob_camera_node_ || device_connecting_.load() || reset_device_flag_.load()) {
+    return;
+  }
+  if (ob_camera_node_->takeReconnectRequest()) {
+    requestSoftwareReconnect(
+        "Control channel failed or video stream stalled, reconnecting device");
+  }
+}
+
+bool OBCameraNodeDriver::isDeviceInUseError(const ob::Error &error) const {
+  const int status = static_cast<int>(error.getStatus());
+  if (status == OB_ERROR_RESOURCE_BUSY || status == OB_ERROR_DEVICE_ACCESS_DENIED) {
+    return true;
+  }
+  const char *message = error.getMessage();
+  if (message == nullptr) {
+    return false;
+  }
+  const std::string text(message);
+  return text.find("elsewhere") != std::string::npos || text.find("busy") != std::string::npos ||
+         text.find("Busy") != std::string::npos || text.find("acquired") != std::string::npos ||
+         text.find("occupied") != std::string::npos || text.find("in use") != std::string::npos;
+}
+
+void OBCameraNodeDriver::requestSoftwareReconnect(const char *reason) {
+  std::lock_guard<decltype(reset_device_mutex_)> lock(reset_device_mutex_);
+  if (!device_connected_.load() || reset_device_flag_.load()) {
+    return;
+  }
+  RCLCPP_ERROR_STREAM(logger_, reason);
+  delay_stream_start_after_reconnect_ = true;
+  reset_device_flag_ = true;
+  reset_device_cond_.notify_all();
 }
 
 void OBCameraNodeDriver::queryDevice() {
@@ -567,9 +601,57 @@ void OBCameraNodeDriver::queryDevice() {
       if (!enumerate_net_device_ && !net_device_ip_.empty() && net_device_port_ != 0) {
         connectNetDevice(net_device_ip_, net_device_port_);
       } else {
-        auto device_list = ctx_->queryDeviceList();
-        if (device_list->getCount() != 0) {
-          startDevice(device_list);
+        struct ProcessDeviceLock {
+          explicit ProcessDeviceLock(pthread_mutex_t *mutex) : mutex_(mutex) {}
+          ~ProcessDeviceLock() { unlock(); }
+          bool lock_for(std::chrono::milliseconds timeout) {
+            if (mutex_ == nullptr) {
+              return false;
+            }
+            const auto deadline = std::chrono::system_clock::now() + timeout;
+            const auto seconds = std::chrono::time_point_cast<std::chrono::seconds>(deadline);
+            const auto nanos =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - seconds);
+            timespec ts{};
+            ts.tv_sec = static_cast<time_t>(seconds.time_since_epoch().count());
+            ts.tv_nsec = static_cast<long>(nanos.count());
+            owned_ = pthread_mutex_timedlock(mutex_, &ts) == 0;
+            return owned_;
+          }
+          void unlock() {
+            if (owned_ && mutex_ != nullptr) {
+              pthread_mutex_unlock(mutex_);
+              owned_ = false;
+            }
+          }
+          pthread_mutex_t *mutex_ = nullptr;
+          bool owned_ = false;
+        };
+
+        ProcessDeviceLock process_lock(orb_device_lock_);
+        if (!process_lock.lock_for(std::chrono::milliseconds(500))) {
+          RCLCPP_WARN_STREAM(logger_,
+                             "Device lock is held by another process, skip enumeration this cycle");
+        } else {
+          try {
+            auto device_list = ctx_->queryDeviceList();
+            if (device_list && device_list->getCount() != 0) {
+              startDevice(device_list, true);
+            }
+          } catch (const ob::Error &e) {
+            RCLCPP_ERROR_STREAM(logger_, "queryDeviceList failed: "
+                                             << orbbec_camera::formatObErrorWithStatus(e));
+          } catch (const std::exception &e) {
+            RCLCPP_ERROR_STREAM(logger_, "queryDeviceList failed: " << e.what());
+          } catch (...) {
+            RCLCPP_ERROR_STREAM(logger_, "queryDeviceList failed");
+          }
+          process_lock.unlock();
+          if (device_open_busy_.exchange(false)) {
+            RCLCPP_WARN_STREAM(
+                logger_, "Device is in use by another process, retry in 10 seconds without reset");
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+          }
         }
       }
     }
@@ -1036,9 +1118,17 @@ std::shared_ptr<ob::Device> OBCameraNodeDriver::selectDeviceByUSBPort(
     }
     return device;
   } catch (ob::Error &e) {
-    RCLCPP_ERROR_STREAM_THROTTLE(
-        logger_, *get_clock(), 5000,
-        "Failed to get device info " << orbbec_camera::formatObErrorWithStatus(e));
+    if (isDeviceInUseError(e)) {
+      device_open_busy_.store(true);
+      RCLCPP_WARN_STREAM_THROTTLE(logger_, *get_clock(), 5000,
+                                  "USB device "
+                                      << usb_port << " is in use by another process: "
+                                      << orbbec_camera::formatObErrorWithStatus(e));
+    } else {
+      RCLCPP_ERROR_STREAM_THROTTLE(
+          logger_, *get_clock(), 5000,
+          "Failed to get device info " << orbbec_camera::formatObErrorWithStatus(e));
+    }
   } catch (std::exception &e) {
     RCLCPP_ERROR_STREAM_THROTTLE(logger_, *get_clock(), 5000,
                                  "Failed to get device info " << e.what());
@@ -1490,7 +1580,8 @@ void OBCameraNodeDriver::connectNetDevice(const std::string &net_device_ip, int 
   }
 }
 
-void OBCameraNodeDriver::startDevice(const std::shared_ptr<ob::DeviceList> &list) {
+void OBCameraNodeDriver::startDevice(const std::shared_ptr<ob::DeviceList> &list,
+                                     bool process_lock_held) {
   if (device_connected_.load()) {
     return;
   }
@@ -1520,32 +1611,34 @@ void OBCameraNodeDriver::startDevice(const std::shared_ptr<ob::DeviceList> &list
     device_.reset();
   }
   std::this_thread::sleep_for(std::chrono::milliseconds(connection_delay_));
-  int try_lock_count = 0;
-  int max_try_lock_count = 5;
+  std::shared_ptr<int> lock_holder(nullptr, [](int *) {});
+  if (!process_lock_held) {
+    int try_lock_count = 0;
+    int max_try_lock_count = 5;
 
-  while (try_lock_count < max_try_lock_count) {
-    int try_lock_result = pthread_mutex_trylock(orb_device_lock_);
+    while (try_lock_count < max_try_lock_count) {
+      int try_lock_result = pthread_mutex_trylock(orb_device_lock_);
 
-    if (try_lock_result == 0) {
-      // success get lock,break
-      break;
-    } else if (try_lock_result == EBUSY) {
-      RCLCPP_WARN_STREAM(logger_, "Device lock is held by another process, waiting 100ms");
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    } else {
+      if (try_lock_result == 0) {
+        break;
+      } else if (try_lock_result == EBUSY) {
+        RCLCPP_WARN_STREAM(logger_, "Device lock is held by another process, waiting 100ms");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      } else {
+        RCLCPP_ERROR_STREAM(logger_, "Failed to lock orb_device_lock_");
+        return;
+      }
+
+      try_lock_count++;
+    }
+    if (try_lock_count >= max_try_lock_count) {
       RCLCPP_ERROR_STREAM(logger_, "Failed to lock orb_device_lock_");
-      return;  // Not EBUSY, return
+      return;
     }
 
-    try_lock_count++;
+    lock_holder = std::shared_ptr<int>(
+        nullptr, [this](int *) { pthread_mutex_unlock(orb_device_lock_); });
   }
-  if (try_lock_count >= max_try_lock_count) {
-    RCLCPP_ERROR_STREAM(logger_, "Failed to lock orb_device_lock_");
-    return;
-  }
-
-  std::shared_ptr<int> lock_holder(nullptr,
-                                   [this](int *) { pthread_mutex_unlock(orb_device_lock_); });
   bool start_device_failed = false;
   try {
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -1585,6 +1678,11 @@ void OBCameraNodeDriver::startDevice(const std::shared_ptr<ob::DeviceList> &list
   } catch (ob::Error &e) {
     RCLCPP_ERROR_STREAM(
         logger_, "Failed to initialize device " << orbbec_camera::formatObErrorWithStatus(e));
+    if (isDeviceInUseError(e)) {
+      device_open_busy_.store(true);
+      device_connected_ = false;
+      return;
+    }
     start_device_failed = true;
   } catch (std::exception &e) {
     RCLCPP_ERROR_STREAM(logger_, "Failed to initialize device " << e.what());

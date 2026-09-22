@@ -234,6 +234,14 @@ class OBCameraNode {
     return user_calibration_ready_;
   }
 
+  // Called from the frame callback when a color or depth frame object arrives.
+  // A later decode failure does not clear this timestamp.
+  void recordVideoFrameArrival(bool color, bool depth);
+
+  // True once when the control channel fails repeatedly or both enabled
+  // video streams have been silent. The caller performs one software reconnect.
+  bool takeReconnectRequest();
+
  private:
   struct IMUData {
     IMUData() = default;
@@ -656,6 +664,13 @@ class OBCameraNode {
   std::unique_ptr<ob::Pipeline> pipeline_ = nullptr;
   std::unique_ptr<ob::Pipeline> imuPipeline_ = nullptr;
   std::atomic_bool pipeline_started_{false};
+  void noteControlLinkFailure(bool link_dead);
+  bool enabledVideoStreamsStalled() const;
+  std::atomic<int> consecutive_control_failures_{0};
+  std::atomic<int64_t> streams_started_ns_{0};
+  std::atomic<int64_t> last_color_frame_ns_{0};
+  std::atomic<int64_t> last_depth_frame_ns_{0};
+  std::atomic_bool reconnect_requested_{false};
   std::string camera_name_ = "camera";
   std::string accel_gyro_frame_id_ = "camera_accel_gyro_optical_frame";
   const std::string imu_frame_id_ = "camera_gyro_frame";

@@ -63,7 +63,11 @@ class OBCameraNodeDriver : public rclcpp::Node {
 
   void exportBagPresetJson(const std::string& bag_path);
 
-  void startDevice(const std::shared_ptr<ob::DeviceList>& list);
+  void startDevice(const std::shared_ptr<ob::DeviceList>& list, bool process_lock_held = false);
+
+  bool isDeviceInUseError(const ob::Error& error) const;
+
+  void requestSoftwareReconnect(const char* reason);
 
   void connectNetDevice(const std::string& net_device_ip, int net_device_port);
 
@@ -132,6 +136,7 @@ class OBCameraNodeDriver : public rclcpp::Node {
   std::mutex reset_device_mutex_;
   std::condition_variable reset_device_cond_;
   std::atomic_bool reset_device_flag_{false};
+  std::atomic_bool device_open_busy_{false};
   std::chrono::steady_clock::time_point last_reset_device_completion_time_;
   pthread_mutex_t* orb_device_lock_ = nullptr;
   pthread_mutexattr_t orb_device_lock_attr_;

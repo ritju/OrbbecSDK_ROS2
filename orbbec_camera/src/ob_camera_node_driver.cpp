@@ -60,6 +60,17 @@ std::string getDefaultBagRecordFilePath() {
       .string();
 }
 
+// USB uid is "bus-port.port...". Re-enumeration can swap bus 1 and 2; the port path stays.
+std::string alternateUsbBusPort(const std::string &usb_port) {
+  if (usb_port.rfind("2-", 0) == 0) {
+    return "1-" + usb_port.substr(2);
+  }
+  if (usb_port.rfind("1-", 0) == 0) {
+    return "2-" + usb_port.substr(2);
+  }
+  return "";
+}
+
 std::string makeDefaultSdkLogFileName() {
   const std::time_t now_time = std::time(nullptr);
   std::tm tm{};
@@ -1101,41 +1112,85 @@ std::shared_ptr<ob::Device> OBCameraNodeDriver::selectDeviceBySerialNumber(
 }
 std::shared_ptr<ob::Device> OBCameraNodeDriver::selectDeviceByUSBPort(
     const std::shared_ptr<ob::DeviceList> &list, const std::string &usb_port) {
-  try {
-    RCLCPP_INFO_STREAM_THROTTLE(logger_, *get_clock(), 5000,
-                                "Selecting device by USB port: " << usb_port);
-    std::lock_guard<decltype(device_lock_)> lock(device_lock_);
-    auto device = list->getDeviceByUid(usb_port.c_str(), device_access_mode_);
-    if (device) {
-      RCLCPP_INFO_STREAM_THROTTLE(logger_, *get_clock(), 5000,
-                                  "getDeviceByUid device usb port " << usb_port << " done");
-    } else {
+  // missing: uid is not in the list, so the other bus number may still match.
+  // A device held by another process is not missing; do not open a different port.
+  auto open_by_uid = [&](const std::string &uid, bool &missing,
+                         std::string &error_text) -> std::shared_ptr<ob::Device> {
+    missing = false;
+    error_text.clear();
+    try {
+      auto opened = list->getDeviceByUid(uid.c_str(), device_access_mode_);
+      if (!opened) {
+        missing = true;
+      }
+      return opened;
+    } catch (const ob::Error &e) {
+      error_text = orbbec_camera::formatObErrorWithStatus(e);
+      if (isDeviceInUseError(e)) {
+        device_open_busy_.store(true);
+        RCLCPP_WARN_STREAM_THROTTLE(logger_, *get_clock(), 5000,
+                                    "USB device "
+                                        << uid << " is in use by another process: " << error_text);
+        return nullptr;
+      }
+      missing = true;
+      return nullptr;
+    } catch (const std::exception &e) {
+      error_text = e.what();
       RCLCPP_ERROR_STREAM_THROTTLE(logger_, *get_clock(), 5000,
-                                   "getDeviceByUid device usb port " << usb_port << " failed");
-      RCLCPP_ERROR_STREAM_THROTTLE(
-          logger_, *get_clock(), 5000,
-          "Please use script to get usb port: ros2 run orbbec_camera list_devices_node");
+                                   "Failed to get device info " << error_text);
+      return nullptr;
+    } catch (...) {
+      error_text = "unknown error";
+      RCLCPP_ERROR_STREAM_THROTTLE(logger_, *get_clock(), 5000, "Failed to get device info");
+      return nullptr;
     }
+  };
+
+  RCLCPP_INFO_STREAM_THROTTLE(logger_, *get_clock(), 5000,
+                              "Selecting device by USB port: " << usb_port);
+  std::lock_guard<decltype(device_lock_)> lock(device_lock_);
+
+  bool missing = false;
+  std::string error_text;
+  auto device = open_by_uid(usb_port, missing, error_text);
+  if (device) {
+    RCLCPP_INFO_STREAM_THROTTLE(logger_, *get_clock(), 5000,
+                                "getDeviceByUid device usb port " << usb_port << " done");
     return device;
-  } catch (ob::Error &e) {
-    if (isDeviceInUseError(e)) {
-      device_open_busy_.store(true);
-      RCLCPP_WARN_STREAM_THROTTLE(logger_, *get_clock(), 5000,
-                                  "USB device "
-                                      << usb_port << " is in use by another process: "
-                                      << orbbec_camera::formatObErrorWithStatus(e));
-    } else {
-      RCLCPP_ERROR_STREAM_THROTTLE(
-          logger_, *get_clock(), 5000,
-          "Failed to get device info " << orbbec_camera::formatObErrorWithStatus(e));
-    }
-  } catch (std::exception &e) {
-    RCLCPP_ERROR_STREAM_THROTTLE(logger_, *get_clock(), 5000,
-                                 "Failed to get device info " << e.what());
-  } catch (...) {
-    RCLCPP_ERROR_STREAM_THROTTLE(logger_, *get_clock(), 5000, "Failed to get device info");
+  }
+  if (!missing) {
+    return nullptr;
   }
 
+  const std::string alt_port = alternateUsbBusPort(usb_port);
+  if (!alt_port.empty()) {
+    bool alt_missing = false;
+    const std::string primary_error = error_text;
+    device = open_by_uid(alt_port, alt_missing, error_text);
+    if (device) {
+      RCLCPP_WARN_STREAM(logger_, "USB port " << usb_port << " not found, switched to " << alt_port
+                                              << " after USB bus renumber");
+      if (usb_port_ == usb_port) {
+        usb_port_ = alt_port;
+      }
+      return device;
+    }
+    if (!alt_missing) {
+      return nullptr;
+    }
+    error_text = primary_error;
+  }
+
+  if (!error_text.empty()) {
+    RCLCPP_ERROR_STREAM_THROTTLE(logger_, *get_clock(), 5000,
+                                 "Failed to get device info " << error_text);
+  }
+  RCLCPP_ERROR_STREAM_THROTTLE(logger_, *get_clock(), 5000,
+                               "getDeviceByUid device usb port " << usb_port << " failed");
+  RCLCPP_ERROR_STREAM_THROTTLE(
+      logger_, *get_clock(), 5000,
+      "Please use script to get usb port: ros2 run orbbec_camera list_devices_node");
   return nullptr;
 }
 
